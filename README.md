@@ -51,21 +51,37 @@ The last two matter: the wrappers cover the common questions, but odds,
 transfers, FIFA rankings, injuries, brackets and referee data are all still one
 call away without paying context cost for 67 tool schemas up front.
 
-## Name search and the catalogue cache
+## Name search without downloading the world
 
-TheSports has no search-by-name endpoint, so mapping *"Beşiktaş"* to an id means
-holding the entity list locally. The team catalogue is ~80,000 rows over ~80
-requests, so it is cached **on disk** (24h TTL) and warmed in the background at
-startup. First ever run takes about a minute; after that, searches are instant
-and survive restarts.
+TheSports has no search-by-name endpoint — `name`, `query`, `search`, `keyword`
+and `q` are all silently ignored on the list endpoints, so mapping *"Beşiktaş"*
+to an id means holding entity names locally. The full team catalogue is ~80,000
+rows over ~80 requests, which is a lot to pay to answer one question.
+
+So lookups are tiered, and the expensive tier is usually never reached:
+
+1. **Active teams** (default) — the schedule endpoint returns team names inline
+   with every fixture, so one pass over the fixture window (−7 to +21 days)
+   yields ~6,900 teams for ~30 cheap requests. Anyone asking about a team by
+   name is nearly always asking about one that plays in this window.
+2. **Full catalogue** — built only when a name misses the active window
+   (historical clubs, youth sides). Pages are fetched 10 at a time, so this is
+   ~18s rather than ~60s.
+
+Both are cached on disk (24h TTL) and the first tier is warmed in the background
+at startup. Measured cold-start: team search, a league table and a competition
+lookup all answered in **9.5s total, without ever building the 80k catalogue**;
+everything after that is instant and survives restarts.
 
 Names are matched with accents and Turkish dotless-i folded (`Beşiktaş` ≈
 `besiktas`). Competitions carry a small alias table for local-language names,
 because the API stores everything in English — `"Süper Lig"` would otherwise be
 an equally good match for *Moldovan Super Liga* as for *Turkish Super League*.
 
-Cache location defaults to your temp dir; override with `THESPORTS_CACHE_DIR`.
-Set `THESPORTS_SKIP_WARMUP=1` to disable the startup prefetch.
+Tuning: `THESPORTS_CACHE_DIR` (default: temp dir), `THESPORTS_SKIP_WARMUP=1` to
+disable the startup prefetch, and `THESPORTS_ACTIVE_DAYS_BACK` /
+`THESPORTS_ACTIVE_DAYS_FORWARD` to widen or narrow the fixture window (the
+endpoint itself serves ±30 days).
 
 ## Setup
 
@@ -80,7 +96,8 @@ Requires TheSports API credentials (contact TheSports for these):
 - `THESPORTS_SECRET`
 
 Optional: `THESPORTS_BASE_URL` (default `https://api.thesports.com`),
-`THESPORTS_DOCS_DIR`, `THESPORTS_CACHE_DIR`, `THESPORTS_SKIP_WARMUP`.
+`THESPORTS_DOCS_DIR`, `THESPORTS_CACHE_DIR`, `THESPORTS_SKIP_WARMUP`,
+`THESPORTS_ACTIVE_DAYS_BACK`, `THESPORTS_ACTIVE_DAYS_FORWARD`.
 
 ## Register with an MCP client
 

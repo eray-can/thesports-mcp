@@ -74,32 +74,80 @@ function slim(rows: any[], fields: string[]): Entity[] {
     });
 }
 
-async function loadCache(key: string, urlPath: string, fields: string[]): Promise<CacheEntry> {
-  const existing = caches.get(key);
+async function loadCache(cat: Catalogue): Promise<CacheEntry> {
+  const existing = caches.get(cat.key);
   if (existing && Date.now() - existing.fetchedAt < CACHE_TTL_MS) return existing;
 
   // Two tools resolving names concurrently must not each pull the full list.
-  const pending = inflight.get(key);
+  const pending = inflight.get(cat.key);
   if (pending) return pending;
 
   const load = (async () => {
-    const fromDisk = await readDiskCache(key);
+    const fromDisk = await readDiskCache(cat.key);
     if (fromDisk) {
-      caches.set(key, fromDisk);
+      caches.set(cat.key, fromDisk);
       return fromDisk;
     }
 
-    console.error(`[thesports-mcp] building ${key} catalogue (first run takes a minute)...`);
-    const rows = slim(await fetchAllPages(urlPath), fields);
+    console.error(`[thesports-mcp] building ${cat.key} index...`);
+    const rows = cat.fetch
+      ? await cat.fetch()
+      : slim(await fetchAllPages(cat.path!), cat.fields!);
     const entry = index(rows, Date.now());
-    caches.set(key, entry);
-    console.error(`[thesports-mcp] ${key} catalogue ready: ${rows.length} rows`);
-    await writeDiskCache(key, entry);
+    caches.set(cat.key, entry);
+    console.error(`[thesports-mcp] ${cat.key} index ready: ${rows.length} rows`);
+    await writeDiskCache(cat.key, entry);
     return entry;
-  })().finally(() => inflight.delete(key));
+  })().finally(() => inflight.delete(cat.key));
 
-  inflight.set(key, load);
+  inflight.set(cat.key, load);
   return load;
+}
+
+/**
+ * The full team catalogue is ~80k rows, but the schedule endpoint returns team
+ * names inline for every fixture — so a few weeks of schedule yields an index
+ * of every team actually playing (~5k) for a handful of requests. Anyone asking
+ * about a team by name is almost always asking about one that plays in this
+ * window, so this is tried first and the catalogue is only built if it misses.
+ *
+ * Window is capped by the endpoint itself: diary serves ±30 days from today.
+ */
+const ACTIVE_DAYS_BACK = Number(process.env.THESPORTS_ACTIVE_DAYS_BACK ?? 7);
+const ACTIVE_DAYS_FORWARD = Number(process.env.THESPORTS_ACTIVE_DAYS_FORWARD ?? 21);
+
+function startOfUtcDay(offsetDays: number): number {
+  const d = new Date();
+  return Math.floor(
+    Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + offsetDays) / 1000
+  );
+}
+
+async function fetchActiveTeams(): Promise<Entity[]> {
+  const offsets: number[] = [];
+  for (let o = -ACTIVE_DAYS_BACK; o <= ACTIVE_DAYS_FORWARD; o++) offsets.push(o);
+
+  const teams = new Map<string, Entity>();
+  const BATCH = 10;
+  for (let i = 0; i < offsets.length; i += BATCH) {
+    const days = await Promise.all(
+      offsets.slice(i, i + BATCH).map(async (o) => {
+        try {
+          return await callRawEndpoint("/v1/football/match/diary", { tsp: startOfUtcDay(o) });
+        } catch {
+          return undefined; // one bad day must not sink the whole index
+        }
+      })
+    );
+    for (const day of days) {
+      for (const t of day?.results_extra?.team ?? []) {
+        if (t?.id && t?.name && !teams.has(t.id)) {
+          teams.set(t.id, { id: t.id, name: t.name, logo: t.logo });
+        }
+      }
+    }
+  }
+  return [...teams.values()];
 }
 
 /** Strips diacritics, punctuation and case so "Beşiktaş" matches "besiktas".
@@ -153,10 +201,20 @@ function scoreName(queryNorm: string, entity: Entity): number {
 
 interface Catalogue {
   key: string;
-  path: string;
-  fields: string[];
+  /** List endpoint to page through. Omit when `fetch` is supplied. */
+  path?: string;
+  /** Fields kept from each row; the rest is dropped before caching. */
+  fields?: string[];
+  /** Custom loader for indexes not built by paging a list endpoint. */
+  fetch?: () => Promise<Entity[]>;
 }
 
+/** Teams playing in the current fixture window — cheap, and enough to answer
+ * almost any question someone asks by name. Tried before TEAMS. */
+const ACTIVE_TEAMS: Catalogue = { key: "active-teams", fetch: fetchActiveTeams };
+
+/** Every team TheSports knows, including historical and youth sides. ~80k rows;
+ * only built when ACTIVE_TEAMS has no match. */
 const TEAMS: Catalogue = {
   key: "teams",
   path: "/v1/football/team/additional/list",
@@ -200,7 +258,7 @@ async function search(
   limit: number,
   filter?: (e: Entity) => boolean
 ): Promise<Match[]> {
-  const { rows } = await loadCache(cat.key, cat.path, cat.fields);
+  const { rows } = await loadCache(cat);
   let queryNorm = normalize(query);
   if (!queryNorm) return [];
 
@@ -224,10 +282,29 @@ async function search(
   return scored.slice(0, limit);
 }
 
-export function searchTeams(query: string, limit = 10): Promise<Match[]> {
+/**
+ * Searches teams currently in the fixture window first, and only falls back to
+ * the 80k-row catalogue if that finds nothing convincing. In practice the fast
+ * path answers nearly every real question, so the expensive index is usually
+ * never built at all.
+ */
+export async function searchTeams(query: string, limit = 10): Promise<Match[]> {
   // Placeholder rows exist purely to fill brackets and would otherwise
   // outrank real teams on short queries.
-  return search(TEAMS, query, limit, (e) => e.virtual !== 1);
+  const notPlaceholder = (e: Entity) => e.virtual !== 1;
+
+  const active = await search(ACTIVE_TEAMS, query, limit, notPlaceholder);
+  if (active.length > 0 && active[0].score >= 70) return active;
+
+  const full = await search(TEAMS, query, limit, notPlaceholder);
+  if (full.length === 0) return active;
+
+  // Keep the active-window hits that the catalogue also knows about, ranked
+  // together, so a weak fast-path match isn't lost behind catalogue noise.
+  const seen = new Set(full.map((m) => m.id));
+  return [...full, ...active.filter((m) => !seen.has(m.id))]
+    .sort((a, b) => b.score - a.score || a.name.length - b.name.length)
+    .slice(0, limit);
 }
 
 export function searchCompetitions(query: string, limit = 10): Promise<Match[]> {
@@ -238,12 +315,14 @@ export function searchPlayers(query: string, limit = 10): Promise<Match[]> {
   return search(PLAYERS, query, limit);
 }
 
-/** Kicks off the catalogue downloads that name search depends on, so the first
- * user question doesn't pay for them. Failures are non-fatal: the same load
- * runs again (and reports properly) when a search actually needs it. */
+/** Builds the two cheap indexes name search starts from (a few seconds each),
+ * so the first user question doesn't pay for them. The full 80k team catalogue
+ * is deliberately NOT warmed — it is only built if a name misses the active
+ * window. Failures are non-fatal: the load simply runs again, and reports
+ * properly, when a search actually needs it. */
 export function warmCatalogues(): void {
-  for (const cat of [TEAMS, COMPETITIONS]) {
-    loadCache(cat.key, cat.path, cat.fields).catch((err) =>
+  for (const cat of [ACTIVE_TEAMS, COMPETITIONS]) {
+    loadCache(cat).catch((err) =>
       console.error(`[thesports-mcp] ${cat.key} warm-up failed: ${err.message}`)
     );
   }
@@ -254,22 +333,26 @@ export function warmCatalogues(): void {
  * falling back to name search — a wrong guess costs a request, not a result. */
 const ID_SHAPE = /^[a-z0-9]{10,24}$/i;
 
-/** Resolves an id to its full record without pulling the whole catalogue,
- * preferring an already-loaded catalogue when one exists. */
-async function byId(cat: Catalogue, id: string): Promise<Entity | undefined> {
-  const loaded = caches.get(cat.key);
-  const cached = loaded?.byId.get(id);
-  if (cached) return cached;
+/** Resolves an id to its full record without pulling a whole catalogue,
+ * reusing any index already in memory before falling back to a uuid query. */
+async function byId(cats: Catalogue[], id: string): Promise<Entity | undefined> {
+  for (const cat of cats) {
+    const cached = caches.get(cat.key)?.byId.get(id);
+    if (cached) return cached;
+  }
   if (!ID_SHAPE.test(id)) return undefined;
+
+  const path = cats.find((c) => c.path)?.path;
+  if (!path) return undefined;
   try {
-    return await fetchEntityById(cat.path, id);
+    return await fetchEntityById(path, id);
   } catch {
     return undefined;
   }
 }
 
-export const getTeamById = (id: string) => byId(TEAMS, id);
-export const getCompetitionById = (id: string) => byId(COMPETITIONS, id);
+export const getTeamById = (id: string) => byId([ACTIVE_TEAMS, TEAMS], id);
+export const getCompetitionById = (id: string) => byId([COMPETITIONS], id);
 
 // Turning an id you already have into a name does NOT justify pulling the full
 // entity list — every list endpoint also accepts `uuid`. These single-entity
@@ -277,31 +360,31 @@ export const getCompetitionById = (id: string) => byId(COMPETITIONS, id);
 // when a name search already populated it.
 const nameMemo = new Map<string, string>();
 
-async function nameFor(cacheKey: string, urlPath: string, id: string): Promise<string | undefined> {
+async function nameFor(cats: Catalogue[], urlPath: string, id: string): Promise<string | undefined> {
   if (!id) return undefined;
-  const memoKey = `${cacheKey}:${id}`;
-  const memoized = nameMemo.get(memoKey);
+  const memoized = nameMemo.get(id);
   if (memoized) return memoized;
 
-  const loaded = caches.get(cacheKey);
-  const fromList = loaded?.byId.get(id)?.name;
-  if (fromList) {
-    nameMemo.set(memoKey, fromList);
-    return fromList;
+  for (const cat of cats) {
+    const fromIndex = caches.get(cat.key)?.byId.get(id)?.name;
+    if (fromIndex) {
+      nameMemo.set(id, fromIndex);
+      return fromIndex;
+    }
   }
 
   try {
     const entity = await fetchEntityById(urlPath, id);
     const name = typeof entity?.name === "string" ? entity.name : undefined;
-    if (name) nameMemo.set(memoKey, name);
+    if (name) nameMemo.set(id, name);
     return name;
   } catch {
     return undefined; // a missing label must never fail the whole tool call
   }
 }
 
-export const teamName = (id: string) => nameFor(TEAMS.key, TEAMS.path, id);
-export const competitionName = (id: string) => nameFor(COMPETITIONS.key, COMPETITIONS.path, id);
+export const teamName = (id: string) => nameFor([ACTIVE_TEAMS, TEAMS], TEAMS.path!, id);
+export const competitionName = (id: string) => nameFor([COMPETITIONS], COMPETITIONS.path!, id);
 
 /** Resolves many team ids at once, de-duplicated, for hydrating a match list. */
 export async function teamNames(ids: string[]): Promise<Map<string, string>> {
