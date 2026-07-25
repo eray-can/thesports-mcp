@@ -8,10 +8,10 @@ import { loadEndpoints, type EndpointDef, type ParamDef } from "./docs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// dist/index.js -> mcp/thesports/dist -> up 3 levels -> repo root -> docs/thesports
+// dist/index.js -> package root -> docs/thesports (bundled alongside this package)
 const DOCS_DIR = process.env.THESPORTS_DOCS_DIR
   ? path.resolve(process.env.THESPORTS_DOCS_DIR)
-  : path.resolve(__dirname, "../../../docs/thesports");
+  : path.resolve(__dirname, "../docs/thesports");
 
 const BASE_URL = (process.env.THESPORTS_BASE_URL || "https://api.thesports.com").replace(/\/$/, "");
 const USER = process.env.THESPORTS_USER;
