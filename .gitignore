@@ -1,2 +1,11 @@
 node_modules/
 dist/
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Local credentials — never commit these
+.env
+.env.*
+!.env.example

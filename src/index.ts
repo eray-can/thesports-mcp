@@ -4,7 +4,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadEndpoints, type EndpointDef, type ParamDef } from "./docs.js";
+import { loadEndpoints } from "./docs.js";
+import { callRawEndpoint, truncate } from "./client.js";
+import { buildTools } from "./tools.js";
+import { warmCatalogues } from "./resolver.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -13,109 +16,134 @@ const DOCS_DIR = process.env.THESPORTS_DOCS_DIR
   ? path.resolve(process.env.THESPORTS_DOCS_DIR)
   : path.resolve(__dirname, "../docs/thesports");
 
-const BASE_URL = (process.env.THESPORTS_BASE_URL || "https://api.thesports.com").replace(/\/$/, "");
-const USER = process.env.THESPORTS_USER;
-const SECRET = process.env.THESPORTS_SECRET;
-
-// Keep tool responses well inside typical LLM context budgets; list endpoints
-// can return thousands of rows and the docs already support page/time/uuid
-// narrowing, so truncating (rather than paginating for the caller) is enough.
-const MAX_RESPONSE_CHARS = 40_000;
-
-function buildInputShape(params: ParamDef[]): z.ZodRawShape {
-  const shape: z.ZodRawShape = {};
-  for (const p of params) {
-    if (p.name === "user" || p.name === "secret") continue; // injected server-side
-    const base: z.ZodTypeAny = p.type === "integer" ? z.number().int() : z.string();
-    const described = base.describe(p.description || p.name);
-    shape[p.name] = p.required ? described : described.optional();
-  }
-  return shape;
+function asText(value: unknown) {
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return { content: [{ type: "text" as const, text: truncate(text) }] };
 }
 
-async function callEndpoint(endpoint: EndpointDef, args: Record<string, unknown>): Promise<string> {
-  if (!USER || !SECRET) {
-    throw new Error(
-      "THESPORTS_USER / THESPORTS_SECRET are not set. Configure them in this MCP server's env before calling any tool."
-    );
-  }
-
-  const query = new URLSearchParams();
-  query.set("user", USER);
-  query.set("secret", SECRET);
-  for (const [key, value] of Object.entries(args)) {
-    if (value === undefined || value === null) continue;
-    query.set(key, String(value));
-  }
-
-  const url = `${BASE_URL}${endpoint.urlPath}?${query.toString()}`;
-  const res = await fetch(url, { method: endpoint.method });
-  const text = await res.text();
-
-  if (!res.ok) {
-    throw new Error(`thesports ${endpoint.toolName} returned HTTP ${res.status}: ${text.slice(0, 500)}`);
-  }
-
-  // TheSports puts gateway auth errors and rate limits inside an HTTP 200 body
-  // instead of using HTTP status codes, so they must be checked explicitly.
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    parsed = undefined;
-  }
-  if (parsed && typeof parsed === "object") {
-    const obj = parsed as Record<string, unknown>;
-    if (typeof obj.err === "string" && obj.err) {
-      throw new Error(`thesports gateway error on ${endpoint.urlPath}: ${obj.err}`);
-    }
-    if (obj.code === 429) {
-      throw new Error(`thesports rate limited (code 429) on ${endpoint.urlPath}. Retry after a short delay.`);
-    }
-  }
-
-  if (text.length > MAX_RESPONSE_CHARS) {
-    return (
-      text.slice(0, MAX_RESPONSE_CHARS) +
-      `\n... [truncated ${text.length - MAX_RESPONSE_CHARS} chars; narrow the query with page/uuid/time params]`
-    );
-  }
-  return text;
+function asError(err: unknown) {
+  return {
+    content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
+    isError: true,
+  };
 }
 
 async function main() {
-  const endpoints = await loadEndpoints(DOCS_DIR);
-  if (endpoints.length === 0) {
-    console.error(`[thesports-mcp] No endpoint docs found in ${DOCS_DIR}`);
-  }
+  const server = new McpServer({ name: "thesports", version: "2.0.0" });
 
-  const server = new McpServer({ name: "thesports", version: "1.0.0" });
-
-  for (const endpoint of endpoints) {
+  // Task-shaped tools: these speak in team names, readable event labels and
+  // resolved scores, so a caller never has to know a TheSports uuid exists.
+  const tools = buildTools(DOCS_DIR);
+  for (const tool of tools) {
     server.registerTool(
-      endpoint.toolName,
-      {
-        title: endpoint.title,
-        description: `${endpoint.description} (${endpoint.method} ${endpoint.urlPath})`.trim(),
-        inputSchema: buildInputShape(endpoint.params),
-      },
+      tool.name,
+      { title: tool.title, description: tool.description, inputSchema: tool.schema },
       async (args) => {
         try {
-          const body = await callEndpoint(endpoint, args as Record<string, unknown>);
-          return { content: [{ type: "text" as const, text: body }] };
+          return asText(await tool.handler(args));
         } catch (err) {
-          return {
-            content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
-            isError: true,
-          };
+          return asError(err);
         }
       }
     );
   }
 
+  // Escape hatch: the tools above cover the common questions, but TheSports
+  // documents 67 endpoints (odds, transfers, rankings, honours, injuries...).
+  // Rather than registering 67 near-identical tools and paying that context
+  // cost on every request, the full catalogue stays discoverable through these
+  // two and is fetched only when something actually needs it.
+  const endpoints = await loadEndpoints(DOCS_DIR);
+  const byPath = new Map(endpoints.map((e) => [e.urlPath, e]));
+
+  server.registerTool(
+    "list_api_endpoints",
+    {
+      title: "List every raw TheSports endpoint",
+      description:
+        "Browse the full TheSports API catalogue when the purpose-built tools don't cover something " +
+        "(odds, transfers, FIFA rankings, honours, injuries, brackets, referee/venue data). " +
+        "Returns each endpoint's path, purpose and parameters; pass a path to call_api_endpoint. " +
+        "Filter with `search` to avoid reading all 67.",
+      inputSchema: {
+        search: z
+          .string()
+          .optional()
+          .describe("Keyword filter, e.g. 'odds', 'transfer', 'ranking', 'injury'"),
+      },
+    },
+    async ({ search }) => {
+      const needle = search?.toLowerCase().trim();
+      const rows = endpoints
+        .filter(
+          (e) =>
+            !needle ||
+            e.urlPath.toLowerCase().includes(needle) ||
+            e.title.toLowerCase().includes(needle) ||
+            e.description.toLowerCase().includes(needle)
+        )
+        .map((e) => ({
+          path: e.urlPath,
+          title: e.title,
+          description: e.description,
+          params: e.params
+            .filter((p) => p.name !== "user" && p.name !== "secret")
+            .map((p) => `${p.name}${p.required ? " (required)" : ""}: ${p.description}`),
+        }));
+      return asText({ matched: rows.length, of: endpoints.length, endpoints: rows });
+    }
+  );
+
+  server.registerTool(
+    "call_api_endpoint",
+    {
+      title: "Call a raw TheSports endpoint",
+      description:
+        "Call any endpoint from list_api_endpoints directly and get the raw JSON back. " +
+        "Authentication is handled for you — pass only the endpoint's own parameters. " +
+        "Prefer the purpose-built tools (get_fixtures, get_match_events, get_standings, ...) when they " +
+        "fit: raw responses use uuids and numeric codes rather than names and labels.",
+      inputSchema: {
+        path: z
+          .string()
+          .describe("Endpoint path exactly as listed, e.g. '/v1/football/player/transfer/list'"),
+        params: z
+          .record(z.union([z.string(), z.number()]))
+          .optional()
+          .describe("Query parameters for that endpoint, e.g. { uuid: 'abc123' } or { page: 1 }"),
+      },
+    },
+    async ({ path: urlPath, params }) => {
+      try {
+        if (!byPath.has(urlPath)) {
+          const guess = endpoints
+            .map((e) => e.urlPath)
+            .filter((p) => p.includes(urlPath) || urlPath.includes(p))
+            .slice(0, 5);
+          throw new Error(
+            `Unknown endpoint "${urlPath}". ` +
+              (guess.length
+                ? `Did you mean: ${guess.join(", ")}?`
+                : `Use list_api_endpoints to see valid paths.`)
+          );
+        }
+        return asText(await callRawEndpoint(urlPath, params ?? {}));
+      } catch (err) {
+        return asError(err);
+      }
+    }
+  );
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`[thesports-mcp] ready — ${endpoints.length} tools registered from ${DOCS_DIR}`);
+  console.error(
+    `[thesports-mcp] ready — ${tools.length} task tools + raw access to ${endpoints.length} endpoints`
+  );
+
+  // Name search needs the full team/competition catalogues. Start downloading
+  // them now (in the background, off the critical path) so the first question
+  // someone asks isn't the one that waits for them.
+  if (process.env.THESPORTS_SKIP_WARMUP !== "1") warmCatalogues();
 }
 
 main().catch((err) => {
